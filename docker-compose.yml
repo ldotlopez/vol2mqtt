@@ -1,0 +1,11 @@
+services:
+  office_volumeter:
+    build:
+      context: .
+    image: vol2mqtt
+    command:
+      - "--mqtt-host=$MQTT_HOST"
+      - "--mqtt-topic=$MQTT_TOPIC"
+      - "--throttle-interval=2"
+      - "--"
+      - "$FFMPEG_INPUT"
