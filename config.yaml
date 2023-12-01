@@ -1,0 +1,16 @@
+mqtt:
+    host:  "mqtt.centinet"
+    port:  1883
+    topic: "tests/vol2mqtt"
+logger:
+  level: 10
+
+throttle:
+  interval: 2
+
+ffmpeg:
+  input:
+    - "-filter_complex"
+    - "anoisesrc=a=0.1:c=white"
+    - -f
+    - wav

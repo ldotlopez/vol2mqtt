@@ -8,11 +8,13 @@ import statistics
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
+import yaml
 from paho.mqtt.client import Client
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logging.basicConfig()
-
 LOGGER = logging.getLogger("vol2mqtt")
 
 PTS_RE = r"\[Parsed_ametadata_1 @ .+?\] frame:\d+\s+pts:\d+\s+pts_time:(\d+\.\d+)"
@@ -21,17 +23,47 @@ VAL_RE = re.compile(
 )
 
 
-class Config:
-    class MQTT:
-        host: str = "mqtt"
-        port: int = 1883
-        topic: str = "test/volume"
+class LoggerSettings(BaseSettings):
+    level: int = logging.DEBUG
 
-    class Throttle:
-        interval: float = 1.0
 
-    class Logger:
-        level: int = logging.INFO
+class ThrottleSettings(BaseSettings):
+    interval: float = 1.0
+
+
+class MQTTSettings(BaseSettings):
+    enable: bool = True
+    host: str = "mqtt.local"
+    port: int = 1883
+    topic: str = "tests/vol2mqtt"
+
+
+class FFMpegSettings(BaseSettings):
+    input: list[str] = ["-filter_complex", "anoisesrc=a=0.1:c=white", "-f", "wav"]
+
+
+class Settings(BaseSettings):
+    ffmpeg: FFMpegSettings = FFMpegSettings()
+    logger: LoggerSettings = LoggerSettings()
+    mqtt: MQTTSettings = MQTTSettings()
+    throttle: ThrottleSettings = ThrottleSettings()
+
+    model_config = SettingsConfigDict(
+        env_prefix="vol2mqtt_", env_file=".env", env_file_encoding="utf-8"
+    )
+
+
+# class Config:
+#     class MQTT:
+#         host: str = "mqtt"
+#         port: int = 1883
+#         topic: str = "test/volume"
+
+#     class Throttle:
+#         interval: float = 1.0
+
+#     class Logger:
+#         level: int = logging.INFO
 
 
 class FFmpeg:
@@ -42,16 +74,26 @@ class FFmpeg:
     ]
     OUTPUT = ["-f", "null", "-"]
 
-    def __init__(self, inputv: list[str]) -> None:
-        if len(inputv) == 1:
-            inputv = ["-i"] + inputv
+    def __init__(self, input: list[str]) -> None:
+        if len(input) == 1:
+            inputv = ["-i"] + input
+        else:
+            inputv = input
 
-        cmdl = ["ffmpeg"] + inputv + self.FILTERS + self.OUTPUT
-        self.proc = subprocess.Popen(cmdl, stderr=subprocess.PIPE)
+        self.proc = None
+        self.cmdl = ["ffmpeg"] + inputv + self.FILTERS + self.OUTPUT
+
+    def _ensure_start(self):
+        if self.proc is None:
+            self.proc = subprocess.Popen(self.cmdl, stderr=subprocess.PIPE)
 
     def readline(self) -> str:
-        return self.proc.stderr.readline().decode("utf-8").strip()  # type: ignore[union-attr]
+        self._ensure_start()
 
+        ret = self.proc.stderr.readline().decode("utf-8").strip()  # type: ignore[union-attr]
+        if ret == '' and self.proc.poll() is None:
+            raise Exception("process finished")
+        return ret
 
 @dataclass
 class FFmpegState:
@@ -108,38 +150,54 @@ class NotAllowedError(Exception):
     pass
 
 
+def load_config_file(path: Path):
+    with path.open("rt") as fh:
+        data = yaml.load(fh, Loader=yaml.CLoader)
+        print(repr(data))
+
+    return Settings(**data)
+
+
 def main():
-    LOGGER.setLevel(Config.Logger.level)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mqtt-host", default=Config.MQTT.host)
-    parser.add_argument("--mqtt-port", default=Config.MQTT.port)
-    parser.add_argument("--mqtt-topic", default=Config.MQTT.topic)
-    parser.add_argument(
-        "--throttle-interval", default=Config.Throttle.interval, type=float
-    )
-    parser.add_argument(dest="input", nargs="+")
+    parser.add_argument("-c", "--config", type=Path)
+    # parser.add_argument("--mqtt-host", default=Config.MQTT.host)
+    # parser.add_argument("--mqtt-port", default=Config.MQTT.port)
+    # parser.add_argument("--mqtt-topic", default=Config.MQTT.topic)
+    # parser.add_argument(
+    #     "--throttle-interval", default=Config.Throttle.interval, type=float
+    # )
+    # parser.add_argument(dest="input", nargs="+")
     args = parser.parse_args()
 
-    Config.MQTT.host = args.mqtt_host
-    Config.MQTT.port = args.mqtt_port
-    Config.MQTT.topic = args.mqtt_topic
-    Config.Throttle.interval = args.throttle_interval
+    if args.config:
+        x = load_config_file(args.config)
+        print(repr(x))
 
-    ff = FFmpeg(args.input)
-    sw = SlidingWindow(size=Config.Throttle.interval)
+    LOGGER.setLevel(x.logger.level)
+
+    # if args.input:
+    #     x.ffmpeg.input = args.input
+
+    print(repr(x))
+
+    ff = FFmpeg(input=x.ffmpeg.input)
+    sw = SlidingWindow(size=x.throttle.interval)
 
     broker = Client()
-    broker.connect(host=Config.MQTT.host, port=Config.MQTT.port)
+    broker.connect(host=x.mqtt.host, port=x.mqtt.port)
 
     state = FFmpegState(timestamp=0.0)
-    barrier = Throttler(interval=Config.Throttle.interval)
+    barrier = Throttler(interval=x.throttle.interval)
 
     while True:
         try:
             line = ff.readline()
         except KeyboardInterrupt:
             break
+
+        LOGGER.debug(f"ffmpeg: got {line}")
 
         if m := re.match(PTS_RE, line):
             state.timestamp = float(m.group(1))
@@ -153,7 +211,7 @@ def main():
 
         try:
             with barrier.allow():
-                broker.publish(topic=Config.MQTT.topic, payload=sw.value)
+                broker.publish(topic=x.mqtt.topic, payload=sw.value)
                 print(sw.value)
 
         except NotAllowedError:
