@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import argparse
 import contextlib
@@ -10,7 +10,7 @@ import subprocess
 import time
 from pathlib import Path
 
-import yaml
+import yaml  # type: ignore[import]
 from paho.mqtt.client import Client
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -105,30 +105,34 @@ class FFmpegState:
         return self.pts is not None and self.value is not None
 
 
-class SlidingWindow:
-    def __init__(self, size: float = 1) -> None:
-        self.size: float = size
-        self.buff: list[tuple[float, float]] = []
+class Softener:
+    def __init__(self, window: float = 1) -> None:
+        self.window: float = window
+        self.q: list[tuple[float, float]] = []
 
-    def push(self, ts: float, value: float):
+    def push(self, ts: float, value: float) -> None:
         while True:
-            if len(self.buff) == 0:
+            if len(self.q) == 0:
                 break
 
-            diff = ts - self.buff[0][0]
-            if diff <= self.size:
+            diff = ts - self.q[0][0]
+            if diff <= self.window:
                 break
 
-            self.buff.pop(0)
+            self.q.pop(0)
 
-        self.buff.append((ts, value))
+        self.q.append((ts, value))
 
     @property
-    def value(self):
-        if len(self.buff) == 0:
-            return None
+    def value(self) -> float:
+        if len(self.q) == 0:
+            raise SoftenerEmpty()
 
-        return statistics.mean([x[1] for x in self.buff])
+        return statistics.mean([x[1] for x in self.q])
+
+
+class SoftenerEmpty(Exception):
+    pass
 
 
 class Throttler:
@@ -140,13 +144,13 @@ class Throttler:
     def allow(self):
         now = time.monotonic()
         if now - self.last_allowed <= self.interval:
-            raise NotAllowedError()
+            raise ThrottlerNotAllowedError()
 
         yield
         self.last_allowed = now
 
 
-class NotAllowedError(Exception):
+class ThrottlerNotAllowedError(Exception):
     pass
 
 
@@ -161,15 +165,9 @@ def load_config_file(path: Path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--config", type=Path)
-    # parser.add_argument("--mqtt-host", default=Config.MQTT.host)
-    # parser.add_argument("--mqtt-port", default=Config.MQTT.port)
-    # parser.add_argument("--mqtt-topic", default=Config.MQTT.topic)
-    # parser.add_argument(
-    #     "--throttle-interval", default=Config.Throttle.interval, type=float
-    # )
     parser.add_argument(dest="input", nargs="*")
-    args = parser.parse_args()
 
+    args = parser.parse_args()
     settings = load_config_file(args.config) if args.config else Settings()
 
     LOGGER.setLevel(settings.logger.level)
@@ -181,7 +179,7 @@ def main():
     LOGGER.info(settings.model_dump_json(indent=4))
 
     ff = FFmpeg(input=settings.ffmpeg.input)
-    sw = SlidingWindow(size=settings.throttle.interval)
+    muffer = Softener(window=settings.throttle.interval)
 
     state = FFmpegState(pts=0.0)
     LOGGER.info("ffmpeg: ready")
@@ -213,7 +211,7 @@ def main():
 
         elif m := re.match(VAL_RE, line):
             state.value = float(m.group(1))
-            sw.push(state.pts, state.value)
+            muffer.push(state.pts, state.value)
 
         if not state.ready:
             continue
@@ -221,11 +219,13 @@ def main():
         try:
             with barrier.allow():
                 LOGGER.debug("throttle: publish allowed")
-                broker.publish(topic=settings.mqtt.topic, payload=sw.value)
+                broker.publish(topic=settings.mqtt.topic, payload=muffer.value)
 
-                LOGGER.info(f"mqtt: published {sw.value:.06f} (pts={state.pts:.02f})")
+                LOGGER.info(
+                    f"mqtt: published {muffer.value:.06f} (pts={state.pts:.02f})"
+                )
 
-        except NotAllowedError:
+        except ThrottlerNotAllowedError:
             LOGGER.debug("throttle: publish denied")
             pass
 
