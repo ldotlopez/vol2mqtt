@@ -2,12 +2,12 @@
 
 import argparse
 import contextlib
+import dataclasses
 import logging
 import re
 import statistics
 import subprocess
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -52,18 +52,8 @@ class Settings(BaseSettings):
         env_prefix="vol2mqtt_", env_file=".env", env_file_encoding="utf-8"
     )
 
-
-# class Config:
-#     class MQTT:
-#         host: str = "mqtt"
-#         port: int = 1883
-#         topic: str = "test/volume"
-
-#     class Throttle:
-#         interval: float = 1.0
-
-#     class Logger:
-#         level: int = logging.INFO
+    class Logger:
+        level: int = logging.DEBUG
 
 
 class FFmpeg:
@@ -82,6 +72,7 @@ class FFmpeg:
 
         self.proc = None
         self.cmdl = ["ffmpeg"] + inputv + self.FILTERS + self.OUTPUT
+        LOGGER.info(f"ffmpeg: {self.cmdl!r}")
 
     def _ensure_start(self):
         if self.proc is None:
@@ -90,19 +81,28 @@ class FFmpeg:
     def readline(self) -> str:
         self._ensure_start()
 
-        ret = self.proc.stderr.readline().decode("utf-8").strip()  # type: ignore[union-attr]
-        if ret == '' and self.proc.poll() is None:
-            raise Exception("process finished")
+        ret = self.proc.stderr.readline()  # type: ignore[attr-defined]
+        if ret == b"":
+            self.proc.terminate()
+            raise FFmpegExit(returncode=self.proc.returncode)
+
+        ret = ret.decode("utf-8").strip()  # type: ignore[union-attr]
         return ret
 
-@dataclass
+
+class FFmpegExit(Exception):
+    def __init__(self, *, returncode):
+        self.returncode = returncode
+
+
+@dataclasses.dataclass
 class FFmpegState:
-    timestamp: float = 0.0
+    pts: float = 0.0
     value: float | None = None
 
     @property
     def ready(self) -> bool:
-        return self.timestamp is not None and self.value is not None
+        return self.pts is not None and self.value is not None
 
 
 class SlidingWindow:
@@ -159,7 +159,6 @@ def load_config_file(path: Path):
 
 
 def main():
-
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--config", type=Path)
     # parser.add_argument("--mqtt-host", default=Config.MQTT.host)
@@ -168,53 +167,66 @@ def main():
     # parser.add_argument(
     #     "--throttle-interval", default=Config.Throttle.interval, type=float
     # )
-    # parser.add_argument(dest="input", nargs="+")
+    parser.add_argument(dest="input", nargs="*")
     args = parser.parse_args()
 
-    if args.config:
-        x = load_config_file(args.config)
-        print(repr(x))
+    settings = load_config_file(args.config) if args.config else Settings()
 
-    LOGGER.setLevel(x.logger.level)
+    LOGGER.setLevel(settings.logger.level)
 
-    # if args.input:
-    #     x.ffmpeg.input = args.input
+    if args.input:
+        settings.ffmpeg.input = args.input
 
-    print(repr(x))
+    LOGGER.info("Running vol2mqtt with config:")
+    LOGGER.info(settings.model_dump_json(indent=4))
 
-    ff = FFmpeg(input=x.ffmpeg.input)
-    sw = SlidingWindow(size=x.throttle.interval)
+    ff = FFmpeg(input=settings.ffmpeg.input)
+    sw = SlidingWindow(size=settings.throttle.interval)
+
+    state = FFmpegState(pts=0.0)
+    LOGGER.info("ffmpeg: ready")
+
+    barrier = Throttler(interval=settings.throttle.interval)
+    LOGGER.info("barrier: ready")
 
     broker = Client()
-    broker.connect(host=x.mqtt.host, port=x.mqtt.port)
-
-    state = FFmpegState(timestamp=0.0)
-    barrier = Throttler(interval=x.throttle.interval)
+    broker.connect(host=settings.mqtt.host, port=settings.mqtt.port)
+    LOGGER.info("mqtt: ready")
 
     while True:
         try:
             line = ff.readline()
+
+        except FFmpegExit as e:
+            if e.returncode != 0:
+                LOGGER.warning("ffmpeg: process failed")
+
+            break
+
         except KeyboardInterrupt:
             break
 
         LOGGER.debug(f"ffmpeg: got {line}")
 
         if m := re.match(PTS_RE, line):
-            state.timestamp = float(m.group(1))
+            state.pts = float(m.group(1))
 
         elif m := re.match(VAL_RE, line):
             state.value = float(m.group(1))
-            sw.push(state.timestamp, state.value)
+            sw.push(state.pts, state.value)
 
         if not state.ready:
             continue
 
         try:
             with barrier.allow():
-                broker.publish(topic=x.mqtt.topic, payload=sw.value)
-                print(sw.value)
+                LOGGER.debug("throttle: publish allowed")
+                broker.publish(topic=settings.mqtt.topic, payload=sw.value)
+
+                LOGGER.info(f"mqtt: published {sw.value:.06f} (pts={state.pts:.02f})")
 
         except NotAllowedError:
+            LOGGER.debug("throttle: publish denied")
             pass
 
 
