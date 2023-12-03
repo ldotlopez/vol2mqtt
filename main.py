@@ -5,13 +5,16 @@ import contextlib
 import dataclasses
 import logging
 import re
+import shlex
 import statistics
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 import yaml  # type: ignore[import]
 from paho.mqtt.client import Client
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logging.basicConfig()
@@ -26,6 +29,16 @@ VAL_RE = re.compile(
 class LoggerSettings(BaseSettings):
     level: int = logging.DEBUG
 
+    @field_validator("level", mode="before")
+    def leven(value: Any) -> int:
+        if isinstance(value, str):
+            try:
+                return getattr(logging, value.upper())
+            except AttributeError as e:
+                raise ValueError(value) from e
+
+        return int(value)
+
 
 class ThrottleSettings(BaseSettings):
     interval: float = 1.0
@@ -39,11 +52,12 @@ class MQTTSettings(BaseSettings):
 
 
 class FFMpegSettings(BaseSettings):
-    input: list[str] = ["-filter_complex", "anoisesrc=a=0.1:c=white", "-f", "wav"]
+    input: str
+    # input: list[str] = ["-filter_complex", "anoisesrc=a=0.1:c=white", "-f", "wav"]
 
 
 class Settings(BaseSettings):
-    ffmpeg: FFMpegSettings = FFMpegSettings()
+    ffmpeg: FFMpegSettings
     logger: LoggerSettings = LoggerSettings()
     mqtt: MQTTSettings = MQTTSettings()
     throttle: ThrottleSettings = ThrottleSettings()
@@ -64,11 +78,12 @@ class FFmpeg:
     ]
     OUTPUT = ["-f", "null", "-"]
 
-    def __init__(self, input: list[str]) -> None:
-        if len(input) == 1:
-            inputv = ["-i"] + input
+    def __init__(self, input: str) -> None:
+        inputv = shlex.split(input)
+        if len(inputv) == 1:
+            inputv = ["-i"] + inputv
         else:
-            inputv = input
+            inputv = inputv
 
         self.proc = None
         self.cmdl = ["ffmpeg"] + inputv + self.FILTERS + self.OUTPUT
@@ -154,26 +169,54 @@ class ThrottlerNotAllowedError(Exception):
     pass
 
 
-def load_config_file(path: Path):
-    with path.open("rt") as fh:
-        data = yaml.load(fh, Loader=yaml.CLoader)
-        print(repr(data))
+def build_settings(
+    *,
+    ffmpeg_input=str,
+    mqtt_host: str | None = None,
+    mqtt_topic: str | None = None,
+    logger_level: str | None = None,
+    path: Path | None = None,
+):
+    ffmpeg_opts = {"input": ffmpeg_input}
+    mqtt_opts = {
+        k: v
+        for k, v in {"host": mqtt_host, "topic": mqtt_topic}.items()
+        if v is not None
+    }
+    logger_opts = {k: v for k, v in {"level": logger_level}.items() if v is not None}
 
+    if path:
+        with path.open("rt") as fh:
+            cfg = yaml.load(fh, Loader=yaml.CLoader)
+    else:
+        cfg = {}
+
+    data = cfg | {"ffmpeg": ffmpeg_opts} | {"mqtt": mqtt_opts} | {"logger": logger_opts}
     return Settings(**data)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--config", type=Path)
-    parser.add_argument(dest="input", nargs="*")
+    parser.add_argument("--mqtt-host")
+    parser.add_argument("--mqtt-topic")
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        choices=["fatal", "critical", "error", "warning", "info", "debug"],
+        default="warning",
+    )
+    parser.add_argument(dest="input", nargs="+")
 
     args = parser.parse_args()
-    settings = load_config_file(args.config) if args.config else Settings()
+    settings = build_settings(
+        ffmpeg_input=" ".join(args.input),
+        mqtt_host=args.mqtt_host,
+        mqtt_topic=args.mqtt_topic,
+        logger_level=args.log_level,
+    )
 
     LOGGER.setLevel(settings.logger.level)
-
-    if args.input:
-        settings.ffmpeg.input = args.input
 
     LOGGER.info("Running vol2mqtt with config:")
     LOGGER.info(settings.model_dump_json(indent=4))
@@ -204,7 +247,7 @@ def main():
         except KeyboardInterrupt:
             break
 
-        LOGGER.debug(f"ffmpeg: got {line}")
+        # LOGGER.debug(f"ffmpeg: got {line}")
 
         if m := re.match(PTS_RE, line):
             state.pts = float(m.group(1))

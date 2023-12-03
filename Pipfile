@@ -1,0 +1,18 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+paho-mqtt = "*"
+pydantic = "*"
+pydantic-settings = "*"
+pyyaml = "*"
+
+[dev-packages]
+pre-commit = "*"
+ipdb = "*"
+ipython = "*"
+
+[requires]
+python_version = "3.11"
