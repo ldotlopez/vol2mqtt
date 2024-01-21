@@ -1,11 +1,15 @@
+version: "3"
 services:
   office_volumeter:
     build:
       context: .
     image: vol2mqtt
+    volumes:
+      - ./config.yaml:/config.yaml
     command:
+      - "--config"
+      - "/config.yaml"
       - "--mqtt-host=$MQTT_HOST"
       - "--mqtt-topic=$MQTT_TOPIC"
-      - "--throttle-interval=2"
       - "--"
       - "$FFMPEG_INPUT"
